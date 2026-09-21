@@ -1,0 +1,8 @@
+pymongo>=4.6
+pypdf>=4.0
+pdfplumber>=0.11
+beautifulsoup4>=4.12
+requests>=2.31
+lxml>=5.0
+python-dotenv>=1.0
+tenacity>=8.2

@@ -1,0 +1,63 @@
+name: Scholarreach Hunt
+
+on:
+  # Render (or manual) workflow_dispatch. 2 runs max: Wave B at +3h via wake on hunt repo.
+  workflow_dispatch:
+    inputs:
+      max_hours:
+        description: "Max runtime hours (default 5.5)"
+        required: false
+        default: "5.5"
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+    name: hunt (${{ matrix.worker }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Independent full pipeline (find → crawlable → links → email+topic)
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
+          HUNT_ENABLED: ${{ secrets.HUNT_ENABLED }}
+          HUNT_WORKER_NUM: ${{ matrix.worker }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
+        run: |
+          MAX_H="${{ github.event.inputs.max_hours || '5.5' }}"
+          MAX_S=$(python -c "print(int(float('$MAX_H') * 3600))")
+          echo "hunt worker ${{ matrix.worker }} HUNT_ENABLED=${HUNT_ENABLED:-unset} max=${MAX_S}s"
+          python -c "
+          from src.hunt_loop import run_loop
+          run_loop(max_runtime_seconds=$MAX_S, idle_sleep=5)
+          "
+
+      - name: Hunt stats
+        if: always()
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
+        run: |
+          python -c "
+          from src import hunt_db
+          try:
+              print('Hunt status:', hunt_db.hunt_stats())
+          except Exception as e:
+              print('stats:', e)
+          "
