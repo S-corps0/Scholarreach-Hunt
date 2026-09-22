@@ -6,3 +6,4 @@ requests>=2.31
 lxml>=5.0
 python-dotenv>=1.0
 tenacity>=8.2
+fonttools>=4.50
