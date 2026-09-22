@@ -181,13 +181,21 @@ def process_one_journal(worker_id: str, src: dict, sess: requests.Session) -> in
     return added
 
 
+
 def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 5):
+    """
+    Match afeni-67 processor: run for the FULL max_runtime_seconds.
+    Never exit early just because OpenAlex pages ran out — restart the scan.
+    Heartbeat log every ~60s so GitHub hosted runners keep the connection.
+    """
     from src.config import HUNT_ENABLED
 
     if not HUNT_ENABLED:
         logger.warning(
             "HUNT_ENABLED is FALSE — hunt idle. Set secret HUNT_ENABLED=true to run."
         )
+        # Still stay alive briefly so the job is not a flash-fail; then exit.
+        time.sleep(min(30, max_runtime_seconds))
         return 0
 
     from src import hunt_db as hdb
@@ -203,31 +211,99 @@ def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 5):
         f"hunt-{os.getenv('GITHUB_RUN_ID', 'local')}-"
         f"w{worker_num}-{uuid.uuid4().hex[:6]}"
     )
-    logger.info("Independent hunt worker %s starting (full pipeline)", worker_id)
+    logger.info(
+        "Worker %s starting (max runtime %ss, idle poll %ss) — full pipeline",
+        worker_id,
+        max_runtime_seconds,
+        idle_sleep,
+    )
 
     sess = _session()
     start = time.time()
     total = 0
-    # Stagger OpenAlex page start so 40 workers don't all hit page 1
-    # Stagger so workers don't all process the same first journals
-    skip = (worker_num - 1) * 3
+    journals_done = 0
+    last_status_log = 0
+    # Stagger so workers do not all hit the same first journals
+    skip_base = (worker_num - 1) * 3
 
-    try:
-        for i, src in enumerate(oa.iter_oa_sources(per_page=25, max_pages=50)):
-            if time.time() - start >= max_runtime_seconds:
-                break
-            if i < skip:
-                continue
-            try:
-                total += process_one_journal(worker_id, src, sess)
-            except Exception as e:
-                logger.exception("%s journal failed: %s", worker_id, e)
-            time.sleep(idle_sleep)
-    except Exception as e:
-        logger.exception("%s source iter failed: %s", worker_id, e)
+    while True:
+        elapsed = time.time() - start
+        if elapsed >= max_runtime_seconds:
+            logger.info(
+                "Reached max runtime (%.0fs). rows=%d journals=%d. Exiting.",
+                elapsed,
+                total,
+                journals_done,
+            )
+            break
+
+        # Heartbeat — critical for long GitHub Actions jobs
+        if elapsed - last_status_log >= 60:
+            remaining = max_runtime_seconds - elapsed
+            logger.info(
+                "Listening / hunting… elapsed=%.0fs remaining=%.0fs rows=%d journals=%d",
+                elapsed,
+                remaining,
+                total,
+                journals_done,
+            )
+            last_status_log = elapsed
+            # Force flush so the runner sees activity
+            for h in logging.root.handlers:
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+
+        try:
+            # Fresh OpenAlex pass each cycle (like polling empty queue then retrying)
+            batch = 0
+            for i, src in enumerate(oa.iter_oa_sources(per_page=25, max_pages=40)):
+                elapsed = time.time() - start
+                if elapsed >= max_runtime_seconds:
+                    break
+                if i < skip_base:
+                    continue
+                # Rotate skip on later cycles so we cover more of the catalog
+                try:
+                    added = process_one_journal(worker_id, src, sess)
+                    total += added
+                    journals_done += 1
+                    batch += 1
+                except Exception as e:
+                    logger.exception("%s journal failed: %s", worker_id, e)
+                time.sleep(idle_sleep)
+                if elapsed - last_status_log >= 60:
+                    remaining = max_runtime_seconds - elapsed
+                    logger.info(
+                        "Hunting… elapsed=%.0fs remaining=%.0fs rows=%d journals=%d",
+                        elapsed,
+                        remaining,
+                        total,
+                        journals_done,
+                    )
+                    last_status_log = elapsed
+
+            if batch == 0:
+                # No sources this pass — sleep like processor idle
+                logger.info(
+                    "%s OpenAlex pass empty or exhausted — idle %ss then rescan",
+                    worker_id,
+                    idle_sleep * 4,
+                )
+                time.sleep(idle_sleep * 4)
+            else:
+                # Small pause before next full rescan
+                time.sleep(idle_sleep * 2)
+                # Change stagger slightly each cycle
+                skip_base = (skip_base + worker_num) % 50
+
+        except Exception as e:
+            logger.exception("%s source iter failed: %s", worker_id, e)
+            time.sleep(idle_sleep * 3)
 
     try:
         logger.info("%s done total_rows=%d stats=%s", worker_id, total, hdb.hunt_stats())
     except Exception:
-        logger.info("%s done total_rows=%d", worker_id, total)
+        logger.info("%s done total_rows=%d journals=%d", worker_id, total, journals_done)
     return total

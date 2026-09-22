@@ -1,44 +1,71 @@
-name: CI
+name: Scholarreach Hunt
 
 on:
+  # Render wake (every ~2 min) or manual. Same pattern as afeni-67 processor.
   workflow_dispatch:
     inputs:
       max_hours:
-        description: "hours"
+        description: "Max runtime hours for this run (default 5.5)"
         required: false
         default: "5.5"
+  repository_dispatch:
+    types: [hunt, enqueue]
+
+# Max 2 active runs via Render wake (Wave A + Wave B @ +3h).
 
 jobs:
-  build:
+  hunt:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
         worker: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
-    name: job-${{ matrix.worker }}
+    name: hunt (${{ matrix.worker }})
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
-      - name: deps
+
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: run
+
+      - name: Run hunt worker ${{ matrix.worker }}
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
           HUNT_ENABLED: ${{ secrets.HUNT_ENABLED }}
           HUNT_WORKER_NUM: ${{ matrix.worker }}
           GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_JOB: hunt-worker-${{ matrix.worker }}
           OPENALEX_MAILTO: ${{ secrets.OPENALEX_MAILTO }}
+          PYTHONUNBUFFERED: "1"
         run: |
           MAX_H="${{ github.event.inputs.max_hours || '5.5' }}"
           MAX_S=$(python -c "print(int(float('$MAX_H') * 3600))")
+          echo "Starting hunt worker ${{ matrix.worker }} (max ${MAX_S}s)..."
           python -c "
           from src.hunt_loop import run_loop
           run_loop(max_runtime_seconds=$MAX_S, idle_sleep=5)
+          "
+
+      - name: Hunt status summary
+        if: always()
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
+        run: |
+          python -c "
+          try:
+              from src import hunt_db
+              print('Hunt status:', hunt_db.hunt_stats())
+          except Exception as e:
+              print('Status skip:', e)
           "
