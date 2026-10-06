@@ -33,4 +33,4 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return default
     return v in ("1", "true", "yes", "on")
 
-HUNT_ENABLED = _env_bool("HUNT_ENABLED", default=False)
+HUNT_ENABLED = _env_bool("HUNT_ENABLED", default=True)

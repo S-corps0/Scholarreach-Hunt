@@ -41,7 +41,7 @@ jobs:
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           MONGODB_DB: ${{ secrets.MONGODB_DB || 'test' }}
-          HUNT_ENABLED: ${{ secrets.HUNT_ENABLED }}
+          HUNT_ENABLED: "true"
           HUNT_WORKER_NUM: ${{ matrix.worker }}
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_JOB: hunt-worker-${{ matrix.worker }}

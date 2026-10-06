@@ -1,17 +1,20 @@
 """
-Auto-hunt fleet with exclusive per-run journal claims.
+Hunt fleet — PKP Beacon OJS first.
 
-Phases:
-  DISCOVER — OpenAlex find + validate journals while ready < ~150–200
-  HARVEST  — one worker owns one journal for the whole run; paginate until dry;
-             next run may continue the same journal.
+OpenAlex discovery is OFF. Workers:
+  - Validate pending pkp_beacon journals → ready | rejected
+  - Harvest ready journals (paginate issues → PDF → email+topic) until dry
 
-No two workers in the same GitHub run process the same journal.
+Killswitch: HUNT_ENABLED (default true if unset in Actions via workflow env).
 """
+from __future__ import annotations
+
 import logging
 import os
 import time
 import uuid
+from datetime import datetime, timezone, timedelta
+
 import requests
 
 logging.basicConfig(
@@ -20,94 +23,133 @@ logging.basicConfig(
 )
 logger = logging.getLogger("scholarreach.hunt")
 
+OPENALEX_HUNT_ENABLED = False  # hard off
 
-def _session():
+
+def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": "Scholarreach-Hunt/2.1 (claim+paginate topic+email)"})
+    s.headers.update({"User-Agent": "Scholarreach-Hunt/3.0 (PKP-OJS topic+email)"})
     return s
 
 
-def discover_one(worker_id: str, src: dict, sess: requests.Session) -> bool:
-    """Validate OpenAlex source and insert as ready if crawlable. Returns True if added."""
-    from src import openalex as oa
+def claim_pending_pkp(worker_id: str):
+    from src import hunt_db as hdb
+
+    now = datetime.now(timezone.utc)
+    return hdb.db()[hdb.JOURNALS_COL].find_one_and_update(
+        {
+            "source": "pkp_beacon",
+            "status": "pending",
+            "$or": [
+                {"claimedBy": {"$exists": False}},
+                {"claimedBy": None},
+                {"claimExpires": {"$lt": now}},
+            ],
+        },
+        {
+            "$set": {
+                "status": "sampling",
+                "claimedBy": worker_id,
+                "claimExpires": now + timedelta(minutes=30),
+                "updatedAt": now,
+            }
+        },
+        sort=[("totalRecordCount", -1)],
+        return_document=True,
+    )
+
+
+def validate_pkp_journal(worker_id: str, job: dict, sess: requests.Session) -> str:
+    """Probe homepage / OAI / sample PDFs. Returns ready|rejected."""
     from src import validate as v
     from src import hunt_db as hdb
 
-    name = src.get("display_name") or "Untitled journal"
-    homepage = (src.get("homepage_url") or "").strip()
-    openalex_id = src.get("id") or ""
-    key = "openalex:" + (
-        openalex_id.split("/")[-1] if "/" in openalex_id else openalex_id or name[:40]
-    )
-
-    existing = hdb.db()[hdb.JOURNALS_COL].find_one({"key": key})
-    if existing:
-        return False
-
-    try:
-        works = oa.works_with_pdfs(openalex_id, per_page=10)
-    except Exception as e:
-        logger.debug("%s openalex works failed %s: %s", worker_id, name[:40], e)
-        return False
-    if len(works) < 5:
-        return False
-
+    key = job.get("key")
+    home = (job.get("homepageUrl") or "").strip()
+    oai = (job.get("oaiUrl") or "").strip()
+    name = (job.get("displayName") or key or "")[:80]
     alive = 0
-    with_title = 0
-    for w in works[:10]:
+    checked = 0
+    pdf_hits = 0
+
+    if home:
+        checked += 1
         try:
-            p = v.probe_pdf(w["pdf_url"], session=sess)
+            r = sess.get(home, timeout=25, allow_redirects=True)
+            if r.status_code < 400 and len(r.text or "") > 200:
+                alive += 1
         except Exception:
-            p = {"alive": False}
-        if p.get("alive"):
-            alive += 1
-            if (w.get("title") or "").strip():
-                with_title += 1
-        time.sleep(0.3)
+            pass
 
-    if alive < 7 or with_title < 5:
-        hdb.upsert_journal(
-            {
-                "key": key,
-                "displayName": str(name)[:160],
-                "homepageUrl": str(homepage)[:500],
-                "openalexId": str(openalex_id)[:120],
-                "issn": src.get("issn") or [],
-                "status": "rejected",
-                "sampleChecked": min(10, len(works)),
-                "alivePdfs": alive,
-            }
-        )
-        return False
+    if oai:
+        checked += 1
+        try:
+            probe = oai if "verb=" in oai.lower() else (oai.rstrip("/") + "?verb=Identify")
+            r = sess.get(probe, timeout=25)
+            body = r.text or ""
+            if r.status_code < 400 and ("OAI-PMH" in body or "Identify" in body or "repositoryName" in body):
+                alive += 1
+        except Exception:
+            pass
 
-    hdb.upsert_journal(
+    if home:
+        try:
+            from src.scraper import discover_from_seeds
+
+            papers = discover_from_seeds(listing_urls=[home], pdf_urls=[], sample_paper_urls=[]) or []
+            for p in papers[:12]:
+                checked += 1
+                u = p.get("pdf_url") or ""
+                if not u:
+                    continue
+                try:
+                    pr = v.probe_pdf(u, session=sess)
+                except Exception:
+                    pr = {"alive": False}
+                if pr.get("alive"):
+                    alive += 1
+                    pdf_hits += 1
+                time.sleep(0.25)
+        except Exception as e:
+            logger.debug("%s discover %s: %s", worker_id, key, e)
+
+    # Crawlable if homepage/OAI ok or at least 2 live PDFs
+    if alive >= 1 or pdf_hits >= 2:
+        status = "ready"
+        reason = None
+    else:
+        status = "rejected"
+        reason = f"pkp_sample alive={alive} checked={checked} pdfs={pdf_hits}"
+
+    hdb.db()[hdb.JOURNALS_COL].update_one(
+        {"key": key},
         {
-            "key": key,
-            "displayName": str(name)[:160],
-            "homepageUrl": str(homepage)[:500],
-            "openalexId": str(openalex_id)[:120],
-            "issn": src.get("issn") or [],
-            "status": "ready",
-            "dry": False,
-            "emailCount": 0,
-            "topicCount": 0,
-            "pdfQueued": 0,
-            "sampleChecked": min(10, len(works)),
-            "alivePdfs": alive,
-        }
+            "$set": {
+                "status": status,
+                "dry": False,
+                "sampleChecked": checked,
+                "sampleAlive": alive,
+                "samplePdfHits": pdf_hits,
+                "rejectReason": reason,
+                "claimedBy": None,
+                "claimExpires": None,
+                "lastCheckedAt": datetime.now(timezone.utc),
+                "updatedAt": datetime.now(timezone.utc),
+            }
+        },
     )
-    logger.info("%s discovered ready journal %s", worker_id, name[:50])
-    return True
+    logger.info("%s %s → %s (%s)", worker_id, name, status, reason or "ok")
+    return status
 
 
-def harvest_journal(worker_id: str, journal: dict, sess: requests.Session, max_seconds: float = 0) -> int:
-    """
-    Continue pagination on one claimed journal until dry or time budget.
-    Never re-process seen PDF URLs.
-    """
+def harvest_one(worker_id: str, run_id: str, sess: requests.Session, budget: float) -> int:
+    """Claim one ready journal and extract emails+topics until budget/dry."""
     from src import hunt_db as hdb
     from src.topic_extract import process_pdf_topic
-    from src import scraper
+
+    journal = hdb.claim_journal_for_run(run_id, worker_id)
+    if not journal:
+        return 0
 
     key = journal["key"]
     homepage = (journal.get("homepageUrl") or "").strip()
@@ -115,290 +157,181 @@ def harvest_journal(worker_id: str, journal: dict, sess: requests.Session, max_s
         hdb.mark_journal_dry(key)
         return 0
 
-    crawl = dict(journal.get("crawl") or {})
+    start = time.time()
+    added = 0
     seen = list(journal.get("seenPdfUrls") or [])
     seen_set = set(seen)
 
-    issue_queue = list(crawl.get("issueQueue") or [])
-    archive_queue = list(crawl.get("archiveQueue") or [])
-    pages_done = set(crawl.get("pagesDone") or [])
-    seed_done = bool(crawl.get("seedDone"))
+    try:
+        from src.scraper import discover_from_seeds
 
-    start = time.time()
-    added = 0
+        papers = discover_from_seeds(
+            listing_urls=[homepage], pdf_urls=[], sample_paper_urls=[]
+        ) or []
+    except Exception as e:
+        logger.warning("%s discover failed %s: %s", worker_id, key, e)
+        papers = []
 
-    def time_up():
-        return max_seconds > 0 and (time.time() - start) >= max_seconds
+    new_pdfs = []
+    for p in papers:
+        u = p.get("pdf_url") or ""
+        if u and u not in seen_set:
+            new_pdfs.append(p)
+            seen_set.add(u)
 
-    def fetch(url: str) -> str:
-        if hasattr(scraper, "_get"):
-            return scraper._get(url, session=sess)
-        r = sess.get(url, timeout=40)
-        r.raise_for_status()
-        return r.text
-
-    def collect_pdfs_from_html(html: str, page_url: str):
-        links = scraper.extract_links_from_html(html, page_url) or []
-        out = []
-        for L in links:
-            if L.get("kind") == "pdf" and L.get("url"):
-                out.append(L["url"])
-            elif L.get("kind") in ("article", "listing") and L.get("url"):
-                # follow article pages for real PDF hrefs (no guessed paths)
-                try:
-                    ah = fetch(L["url"])
-                    for pu in scraper.extract_pdfs_from_article_page(ah, L["url"]) or []:
-                        out.append(pu)
-                    time.sleep(0.25)
-                except Exception:
-                    pass
-        return list(dict.fromkeys(out))
-
-    def try_pdf(url: str, source_page: str) -> bool:
-        nonlocal added
-        if not url or url in seen_set:
-            return False
-        seen_set.add(url)
-        seen.append(url)
-        try:
-            row = process_pdf_topic(url)
-            if row and hdb.save_topic(
-                key,
-                row.get("title") or "",
-                row.get("topic") or row.get("title") or "",
-                url,
-                doi=row.get("doi") or "",
-                source_page=source_page,
-                emails=row.get("emails") or [],
-            ):
-                added += 1
-                return True
-        except Exception as e:
-            logger.debug("%s pdf skip %s: %s", worker_id, url[-40:], e)
-        time.sleep(0.4)
-        return False
-
-    if not seed_done:
-        try:
-            html = fetch(homepage)
-            nav = scraper.expand_ojs_archive_issues(html, homepage) or {}
-            for u in nav.get("issues") or []:
-                if u not in issue_queue:
-                    issue_queue.append(u)
-            for u in nav.get("archive_pages") or []:
-                if u not in archive_queue:
-                    archive_queue.append(u)
-            for L in scraper.extract_links_from_html(html, homepage) or []:
-                u = L.get("url")
-                if not u:
-                    continue
-                if L.get("kind") == "listing" and u not in issue_queue and u not in archive_queue:
-                    if "archive" in u.lower():
-                        archive_queue.append(u)
-                    else:
-                        issue_queue.append(u)
-            for pu in collect_pdfs_from_html(html, homepage):
-                if time_up():
-                    break
-                try_pdf(pu, homepage)
-            seed_done = True
-        except Exception as e:
-            logger.warning("%s seed failed %s: %s", worker_id, key, e)
-            seed_done = True
-
-    def process_listing(page_url: str):
-        if page_url in pages_done:
-            return 0
-        try:
-            html = fetch(page_url)
-        except Exception as e:
-            logger.debug("%s listing %s: %s", worker_id, page_url[-50:], e)
-            pages_done.add(page_url)
-            return 0
-        for pu in collect_pdfs_from_html(html, page_url):
-            if time_up():
-                break
-            try_pdf(pu, page_url)
-        for m in scraper.find_pagination_links(html, page_url) or []:
-            if m and m not in issue_queue and m not in archive_queue and m not in pages_done:
-                issue_queue.append(m)
-        nav = scraper.expand_ojs_archive_issues(html, page_url) or {}
-        for u in nav.get("issues") or []:
-            if u not in issue_queue and u not in pages_done:
-                issue_queue.append(u)
-        pages_done.add(page_url)
-        return 1
-
-    # Walk archive pages then issues
-    while not time_up() and archive_queue:
-        u = archive_queue.pop(0)
-        process_listing(u)
-        hdb.save_crawl_progress(
-            key,
-            {
-                "seedDone": seed_done,
-                "issueQueue": issue_queue[:500],
-                "archiveQueue": archive_queue[:200],
-                "pagesDone": list(pages_done)[-2000:],
-            },
-            list(seen_set),
-            email_count_delta=0,
-        )
-
-    while not time_up() and issue_queue:
-        u = issue_queue.pop(0)
-        process_listing(u)
-        if added and added % 5 == 0:
-            hdb.save_crawl_progress(
-                key,
-                {
-                    "seedDone": seed_done,
-                    "issueQueue": issue_queue[:500],
-                    "archiveQueue": archive_queue[:200],
-                    "pagesDone": list(pages_done)[-2000:],
-                },
-                list(seen_set),
-                email_count_delta=0,
-            )
-
-    dry = seed_done and not issue_queue and not archive_queue
-    hdb.save_crawl_progress(
-        key,
-        {
-            "seedDone": seed_done,
-            "issueQueue": issue_queue[:500],
-            "archiveQueue": archive_queue[:200],
-            "pagesDone": list(pages_done)[-2000:],
-        },
-        list(seen_set),
-        email_count_delta=added,
-    )
-    if dry:
-        logger.info("%s journal %s DRY — pagination finished (+%d emails this session)", worker_id, key, added)
+    if not new_pdfs and not papers:
+        # nothing found — mark dry so we move on
         hdb.mark_journal_dry(key)
-    else:
-        logger.info(
-            "%s journal %s pause queues issue=%d archive=%d seen_pdfs=%d +%d emails",
-            worker_id,
-            key,
-            len(issue_queue),
-            len(archive_queue),
-            len(seen_set),
-            added,
-        )
+        logger.info("%s %s dry (no pdfs)", worker_id, key)
+        return 0
+
+    hdb.bump_pdf_queued(key, len(new_pdfs))
+
+    for p in new_pdfs:
+        if budget > 0 and (time.time() - start) >= budget:
+            break
+        pdf_url = p.get("pdf_url")
+        try:
+            out = process_pdf_topic(pdf_url)
+            if not out:
+                continue
+            emails = out.get("emails") or []
+            if not emails:
+                continue
+            ok = hdb.save_topic(
+                journal_key=key,
+                title=out.get("title") or p.get("title") or "",
+                topic=out.get("topic") or out.get("title") or "untitled",
+                pdf_url=pdf_url,
+                doi=p.get("doi") or out.get("doi") or "",
+                source_page=homepage,
+                author_name=out.get("authorName"),
+                emails=emails,
+            )
+            if ok:
+                added += 1
+                seen.append(pdf_url)
+        except Exception as e:
+            logger.debug("%s pdf skip %s: %s", worker_id, (pdf_url or "")[-40:], e)
+        time.sleep(0.4)
+
+    # persist seen; if we processed the batch and found nothing more, dry
+    crawl = dict(journal.get("crawl") or {})
+    crawl["seedDone"] = True
+    hdb.save_crawl_progress(key, crawl, seen, email_count_delta=added)
+
+    # If discover returned a small finite set and we walked it, mark dry
+    if added == 0 and len(new_pdfs) < 3:
+        hdb.mark_journal_dry(key)
+        logger.info("%s %s marked dry (exhausted small set)", worker_id, key)
+    elif added:
+        logger.info("%s %s +%d emails", worker_id, key, added)
+
     return added
 
 
 def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 5):
     from src.config import HUNT_ENABLED
-    from src import hunt_db as hdb
-    from src import openalex as oa
 
-    if not HUNT_ENABLED:
-        logger.warning("HUNT_ENABLED is FALSE — hunt idle.")
-        time.sleep(min(30, max_runtime_seconds))
+    # Allow empty secret: treat missing as enabled when Actions sets HUNT_ENABLED=true
+    enabled = HUNT_ENABLED
+    if (os.getenv("HUNT_ENABLED") or "").strip() == "":
+        enabled = True  # workflow should pass true; empty secret used to kill the fleet
+
+    if not enabled:
+        logger.warning("HUNT_ENABLED is FALSE — hunt idle")
         return 0
+
+    from src import hunt_db as hdb
 
     try:
         hdb.ensure_hunt_indexes()
     except Exception as e:
-        logger.warning("hunt indexes: %s", e)
+        logger.warning("indexes: %s", e)
 
-    worker_num = int(os.getenv("HUNT_WORKER_NUM") or "1")
-    run_id = str(os.getenv("GITHUB_RUN_ID") or f"local-{uuid.uuid4().hex[:8]}")
-    worker_id = f"hunt-{run_id}-w{worker_num}-{uuid.uuid4().hex[:6]}"
+    try:
+        hdb.db()["systemsettings"].update_one(
+            {"key": "hunt"},
+            {
+                "$set": {
+                    "enabled": True,
+                    "openalexEnabled": False,
+                    "primarySource": "pkp_beacon",
+                    "preferSourceOrder": ["pkp_beacon"],
+                    "updatedAt": datetime.now(timezone.utc),
+                }
+            },
+            upsert=True,
+        )
+    except Exception:
+        pass
+
+    num = int(os.getenv("HUNT_WORKER_NUM") or "1")
+    run_id = os.getenv("GITHUB_RUN_ID") or "local"
+    worker_id = f"hunt-{run_id}-{num}-{uuid.uuid4().hex[:6]}"
     logger.info(
-        "Worker %s starting run=%s max=%ss discover_cap=%s",
+        "Hunt worker %s start (PKP-OJS, openalex=OFF) max=%ss",
         worker_id,
-        run_id,
         max_runtime_seconds,
-        hdb.DISCOVER_CAP,
     )
 
     sess = _session()
     start = time.time()
-    total = 0
-    journals_touched = 0
-    last_status_log = 0
-    skip_base = (worker_num - 1) * 3
+    validated = 0
+    harvested = 0
 
-    while True:
-        elapsed = time.time() - start
-        if elapsed >= max_runtime_seconds:
-            logger.info("Max runtime reached rows=%d journals=%d", total, journals_touched)
+    while time.time() - start < max_runtime_seconds:
+        remaining = max_runtime_seconds - (time.time() - start)
+        if remaining < 30:
             break
 
-        if elapsed - last_status_log >= 60:
-            try:
-                st = hdb.hunt_stats()
-            except Exception:
-                st = {}
-            logger.info(
-                "heartbeat elapsed=%.0fs remaining=%.0fs rows=%d stats=%s",
-                elapsed,
-                max_runtime_seconds - elapsed,
-                total,
-                st,
-            )
-            last_status_log = elapsed
+        # Prefer validating pending PKP until we have a healthy ready pool
+        ready = 0
+        try:
+            ready = hdb.ready_count()
+        except Exception:
+            pass
 
-        remaining = max_runtime_seconds - elapsed
+        # Always try pending first if ready pool is thin OR half the workers validate
+        do_validate = ready < 80 or (num % 2 == 1)
 
-        # --- HARVEST first when catalog is full enough ---
-        if not hdb.should_discover() or hdb.active_harvest_count() > 0:
-            journal = hdb.claim_journal_for_run(run_id, worker_id)
-            if journal:
-                journals_touched += 1
-                budget = min(remaining - 30, 45 * 60)  # up to 45 min on one journal per slice
-                if budget < 60:
-                    budget = max(30, remaining - 10)
+        if do_validate:
+            job = claim_pending_pkp(worker_id)
+            if job:
                 try:
-                    n = harvest_journal(worker_id, journal, sess, max_seconds=budget)
-                    total += n
+                    st = validate_pkp_journal(worker_id, job, sess)
+                    if st == "ready":
+                        validated += 1
                 except Exception as e:
-                    logger.exception("%s harvest failed %s: %s", worker_id, journal.get("key"), e)
-                # keep claim until dry or run ends — release only if not dry so next run continues
-                j2 = hdb.db()[hdb.JOURNALS_COL].find_one({"key": journal["key"]})
-                if j2 and j2.get("dry"):
-                    pass  # already cleared claim in mark_journal_dry
-                # if still not dry, leave claimedByRun=this run so same-run peers skip it;
-                # next run_id will reclaim
-                continue
-            # No journal to harvest
-            if not hdb.should_discover():
-                logger.info("%s no harvest targets; idle", worker_id)
-                time.sleep(idle_sleep * 4)
+                    logger.exception("%s validate fail: %s", worker_id, e)
+                    try:
+                        hdb.db()[hdb.JOURNALS_COL].update_one(
+                            {"key": job.get("key")},
+                            {"$set": {"status": "pending", "claimedBy": None, "claimExpires": None}},
+                        )
+                    except Exception:
+                        pass
                 continue
 
-        # --- DISCOVER ---
-        if hdb.should_discover():
-            batch = 0
-            try:
-                for i, src in enumerate(oa.iter_oa_sources(per_page=25, max_pages=15)):
-                    if time.time() - start >= max_runtime_seconds:
-                        break
-                    if not hdb.should_discover():
-                        logger.info("%s discover cap reached — switch to harvest", worker_id)
-                        break
-                    if i < skip_base:
-                        continue
-                    try:
-                        if discover_one(worker_id, src, sess):
-                            batch += 1
-                    except Exception as e:
-                        logger.exception("%s discover fail: %s", worker_id, e)
-                    time.sleep(idle_sleep)
-            except Exception as e:
-                logger.exception("%s openalex iter: %s", worker_id, e)
-                time.sleep(idle_sleep * 3)
-            if batch == 0:
-                time.sleep(idle_sleep * 3)
-            skip_base = (skip_base + worker_num) % 40
-        else:
+        # Harvest
+        try:
+            n = harvest_one(worker_id, run_id, sess, min(remaining, 1200))
+            if n:
+                harvested += n
+            else:
+                time.sleep(idle_sleep)
+        except Exception as e:
+            logger.exception("%s harvest fail: %s", worker_id, e)
             time.sleep(idle_sleep)
 
+    logger.info(
+        "Hunt worker %s done validated_ready=%d emails=%d",
+        worker_id,
+        validated,
+        harvested,
+    )
     try:
-        logger.info("%s done total_rows=%d stats=%s", worker_id, total, hdb.hunt_stats())
+        logger.info("Hunt stats: %s", hdb.hunt_stats())
     except Exception:
-        logger.info("%s done total_rows=%d", worker_id, total)
-    return total
+        pass
+    return validated + harvested
