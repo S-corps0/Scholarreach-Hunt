@@ -187,7 +187,15 @@ def harvest_one(worker_id: str, run_id: str, sess: requests.Session, budget: flo
 
     hdb.bump_pdf_queued(key, len(new_pdfs))
 
-    for p in new_pdfs:
+    # Prefer newest papers first (year in URL/path), then rest
+    def _year_key(item):
+        import re as _re
+        u = (item.get("pdf_url") or "") + " " + (item.get("title") or "")
+        ys = [int(x) for x in _re.findall(r"(20[0-2]\d|19[89]\d)", u)]
+        return max(ys) if ys else 0
+    new_pdfs = sorted(new_pdfs, key=_year_key, reverse=True)
+
+    for p in new_pdfs:  # newest-first
         if budget > 0 and (time.time() - start) >= budget:
             break
         pdf_url = p.get("pdf_url")
@@ -285,15 +293,16 @@ def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 5):
         if remaining < 30:
             break
 
-        # Prefer validating pending PKP until we have a healthy ready pool
-        ready = 0
+        # Discover only until ready pool hits ~200–250; then all workers harvest to dry
         try:
+            do_validate = hdb.should_discover()
             ready = hdb.ready_count()
         except Exception:
-            pass
-
-        # Always try pending first if ready pool is thin OR half the workers validate
-        do_validate = ready < 80 or (num % 2 == 1)
+            do_validate, ready = True, 0
+        if do_validate:
+            logger.info("%s discover mode (ready=%s)", worker_id, ready)
+        else:
+            logger.info("%s harvest-only mode (ready=%s >= cap) — no new journal discovery", worker_id, ready)
 
         if do_validate:
             job = claim_pending_pkp(worker_id)

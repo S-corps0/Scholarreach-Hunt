@@ -19,9 +19,9 @@ JOURNALS_COL = "huntedjournals"
 TOPICS_COL = "papertopics"
 
 # Stop OpenAlex discovery once we have this many ready journals; harvest only.
-DISCOVER_CAP = int(os.getenv("HUNT_DISCOVER_CAP", "200"))
+DISCOVER_CAP = int(os.getenv("HUNT_DISCOVER_CAP", "250"))  # stop discovering once ~250 ready
 # Resume discovery only when ready-and-not-dry falls below this
-DISCOVER_RESUME_BELOW = int(os.getenv("HUNT_DISCOVER_RESUME_BELOW", "150"))
+DISCOVER_RESUME_BELOW = int(os.getenv("HUNT_DISCOVER_RESUME_BELOW", "200"))
 
 
 def _client_or_connect():
@@ -132,7 +132,7 @@ def claim_journal_for_run(run_id: str, worker_id: str):
                 "updatedAt": now,
             }
         },
-        sort=[("emailCount", ASCENDING), ("updatedAt", ASCENDING)],
+        sort=[("pdfQueued", DESCENDING), ("emailCount", ASCENDING), ("totalRecordCount", DESCENDING), ("updatedAt", ASCENDING)],
         return_document=ReturnDocument.AFTER,
     )
     return doc
