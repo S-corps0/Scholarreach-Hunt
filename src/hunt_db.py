@@ -137,7 +137,7 @@ def claim_journal_for_run(run_id: str, worker_id: str):
                 "updatedAt": now,
             }
         },
-        sort=[("pdfQueued", DESCENDING), ("emailCount", ASCENDING), ("totalRecordCount", DESCENDING), ("updatedAt", ASCENDING)],
+        sort=[("forcePriority", DESCENDING), ("pdfQueued", DESCENDING), ("emailCount", ASCENDING), ("totalRecordCount", DESCENDING), ("updatedAt", ASCENDING)],
         return_document=ReturnDocument.AFTER,
     )
     return doc
