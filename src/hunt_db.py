@@ -18,7 +18,7 @@ APP_DB = os.getenv("MONGODB_DB") or os.getenv("MONGO_DB") or "test"
 JOURNALS_COL = "huntedjournals"
 TOPICS_COL = "papertopics"
 
-# Stop OpenAlex discovery once we have this many ready journals; harvest only.
+# Wave size: discover until this many *non-dry* ready journals, then harvest-only.
 DISCOVER_CAP = int(os.getenv("HUNT_DISCOVER_CAP", "250"))  # stop discovering once ~250 ready
 # Resume discovery only when ready-and-not-dry falls below this
 DISCOVER_RESUME_BELOW = int(os.getenv("HUNT_DISCOVER_RESUME_BELOW", "200"))
@@ -65,22 +65,27 @@ def active_harvest_count() -> int:
 
 def should_discover() -> bool:
     """
-    Discover new journals only while catalog is thin.
-    Once we hold ~150–200 ready journals, focus on harvesting emails.
-    When all are dry (or active harvest count is low), discover again.
+    OpenAlex-style waves on PKP OJS:
+
+    1. Discover/validate until ~DISCOVER_CAP (250) *non-dry* ready journals.
+    2. Harvest those until dry (active → 0). Cross-run claims continue the same journals.
+    3. When the wave is fully dry (active == 0), discover the next ~200–250, repeat.
+
+    Counts use *active* (ready AND not dry), not lifetime ready — so finished
+    waves do not permanently block discovery of the next 200–300.
     """
-    ready = ready_count()
-    active = active_harvest_count()
-    if ready < DISCOVER_RESUME_BELOW:
-        return True
-    if ready >= DISCOVER_CAP and active > 0:
-        return False
-    if ready >= DISCOVER_RESUME_BELOW and active > 0:
-        return False
-    # All scraped dry (or almost) — open discovery again
+    active = active_harvest_count()  # ready & not dry
+    # Wave exhausted → open next discovery batch
     if active == 0:
         return True
-    return ready < DISCOVER_CAP
+    # Already have a full wave to harvest
+    if active >= DISCOVER_CAP:
+        return False
+    # Thin wave — top up toward CAP
+    if active < DISCOVER_RESUME_BELOW:
+        return True
+    # Between RESUME and CAP: keep harvesting; optional light top-up off
+    return False
 
 
 def upsert_journal(doc: dict):

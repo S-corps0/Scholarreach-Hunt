@@ -296,13 +296,20 @@ def run_loop(max_runtime_seconds: int = 5 * 3600 + 1800, idle_sleep: int = 5):
         # Discover only until ready pool hits ~200–250; then all workers harvest to dry
         try:
             do_validate = hdb.should_discover()
+            active = hdb.active_harvest_count()
             ready = hdb.ready_count()
         except Exception:
-            do_validate, ready = True, 0
+            do_validate, active, ready = True, 0, 0
         if do_validate:
-            logger.info("%s discover mode (ready=%s)", worker_id, ready)
+            logger.info(
+                "%s discover/top-up mode (active_undried=%s lifetime_ready=%s cap=%s)",
+                worker_id, active, ready, getattr(hdb, "DISCOVER_CAP", 250),
+            )
         else:
-            logger.info("%s harvest-only mode (ready=%s >= cap) — no new journal discovery", worker_id, ready)
+            logger.info(
+                "%s harvest-only mode (active_undried=%s) — dry current wave before next discovery",
+                worker_id, active,
+            )
 
         if do_validate:
             job = claim_pending_pkp(worker_id)
